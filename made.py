@@ -93,6 +93,10 @@ class MADE(nn.Module):
         for l,m in zip(layers, masks):
             l.set_mask(m)
     
+    def print_mask(self):
+        print('Mask: {}'.format(self.m))
+        return 
+
     def forward(self, x):
         return self.net(x)
 

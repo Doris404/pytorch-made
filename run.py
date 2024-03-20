@@ -3,7 +3,7 @@ Trains MADE on Binarized MNIST, which can be downloaded here:
 https://github.com/mgermain/MADE/releases/download/ICML2015/binarized_mnist.npz
 """
 import argparse
-
+import opacus
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,6 +12,8 @@ import torch.optim as optim
 from torch.autograd import Variable
 
 from made import MADE
+import os 
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 
 # ------------------------------------------------------------------------------
 def run_epoch(split, upto=None):
@@ -34,6 +36,7 @@ def run_epoch(split, upto=None):
             # perform order/connectivity-agnostic training by resampling the masks
             if step % args.resample_every == 0 or split == 'test': # if in test, cycle masks every time
                 model.update_masks()
+                # model.print_mask()
             # forward the model
             xbhat += model(xb)
         xbhat /= nsamples
@@ -52,6 +55,45 @@ def run_epoch(split, upto=None):
     print("%s epoch average loss: %f" % (split, np.mean(lossfs)))
 # ------------------------------------------------------------------------------
 
+def run_epoch_withdp(split, upto=None):
+    torch.set_grad_enabled(split=='train') # enable/disable grad for efficiency of forwarding test batches
+    model.train() if split == 'train' else model.eval()
+    nsamples = 1 if split == 'train' else args.samples
+    x = xtr if split == 'train' else xte
+    N,D = x.size()
+    B = 100 # batch size
+    nsteps = N//B if upto is None else min(N//B, upto)
+    lossfs = []
+    for step in range(nsteps):
+        
+        # fetch the next batch of data
+        xb = Variable(x[step*B:step*B+B])
+        
+        # get the logits, potentially run the same batch a number of times, resampling each time
+        xbhat = torch.zeros_like(xb)
+        for s in range(nsamples):
+            # perform order/connectivity-agnostic training by resampling the masks
+            if step % args.resample_every == 0 or split == 'test': # if in test, cycle masks every time
+                model.update_masks()
+                # model.print_mask()
+            # forward the model
+            xbhat += model(xb)
+        xbhat /= nsamples
+        
+        # evaluate the binary cross entropy loss
+        loss = F.binary_cross_entropy_with_logits(xbhat, xb, size_average=False) / B
+        lossf = loss.data.item()
+        lossfs.append(lossf)
+        
+        # backward/update
+        if split == 'train':
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        
+    print("%s epoch average loss: %f" % (split, np.mean(lossfs)))
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--data-path', required=True, type=str, help="Path to binarized_mnist.npz")
@@ -59,6 +101,7 @@ if __name__ == '__main__':
     parser.add_argument('-n', '--num-masks', type=int, default=1, help="Number of orderings for order/connection-agnostic training")
     parser.add_argument('-r', '--resample-every', type=int, default=20, help="For efficiency we can choose to resample orders/masks only once every this many steps")
     parser.add_argument('-s', '--samples', type=int, default=1, help="How many samples of connectivity/masks to average logits over during inference")
+    parser.add_argument('-dp', '--differential_privacy', type=bool, default=False, help="Wheather use differential privacy")
     args = parser.parse_args()
     # --------------------------------------------------------------------------
     
@@ -67,30 +110,74 @@ if __name__ == '__main__':
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
-    # load the dataset
-    print("loading binarized mnist from", args.data_path)
-    mnist = np.load(args.data_path)
-    xtr, xte = mnist['train_data'], mnist['valid_data']
-    xtr = torch.from_numpy(xtr).cuda()
-    xte = torch.from_numpy(xte).cuda()
+    if args.differential_privacy == False:
+        print('Without differential privacy')
+        # load the dataset
+        print("loading binarized mnist from", args.data_path)
+        mnist = np.load(args.data_path)
+        xtr, xte = mnist['train_data'], mnist['valid_data']
+        xtr = torch.from_numpy(xtr).cuda()
+        xte = torch.from_numpy(xte).cuda()
 
-    # construct model and ship to GPU
-    hidden_list = list(map(int, args.hiddens.split(',')))
-    model = MADE(xtr.size(1), hidden_list, xtr.size(1), num_masks=args.num_masks)
-    print("number of model parameters:",sum([np.prod(p.size()) for p in model.parameters()]))
-    model.cuda()
+        # construct model and ship to GPU
+        hidden_list = list(map(int, args.hiddens.split(',')))
+        model = MADE(xtr.size(1), hidden_list, xtr.size(1), num_masks=args.num_masks)
+        print("number of model parameters:",sum([np.prod(p.size()) for p in model.parameters()]))
+        model.cuda()
 
-    # set up the optimizer
-    opt = torch.optim.Adam(model.parameters(), 1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=45, gamma=0.1)
-    
-    # start the training
-    for epoch in range(100):
-        print("epoch %d" % (epoch, ))
-        scheduler.step(epoch)
-        run_epoch('test', upto=5) # run only a few batches for approximate test accuracy
-        run_epoch('train')
-    
-    print("optimization done. full test set eval:")
-    run_epoch('test')
+        # set up the optimizer
+        opt = torch.optim.Adam(model.parameters(), 1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=45, gamma=0.1)
+        
+        # start the training
+        for epoch in range(100):
+            print("epoch %d" % (epoch, ))
+            scheduler.step(epoch)
+            run_epoch('test', upto=5) # run only a few batches for approximate test accuracy
+            run_epoch('train')
+        
+        print("optimization done. full test set eval:")
+        run_epoch('test')
+    else:
+        print('With differential privacy')
+        # load the dataset
+        print("loading binarized mnist from", args.data_path)
+        mnist = np.load(args.data_path)
+        xtr, xte = mnist['train_data'], mnist['valid_data']
+        xtr = torch.from_numpy(xtr).cuda()
+        xte = torch.from_numpy(xte).cuda()
 
+        # construct model and ship to GPU
+        hidden_list = list(map(int, args.hiddens.split(',')))
+        model = MADE(xtr.size(1), hidden_list, xtr.size(1), num_masks=args.num_masks)
+        print("number of model parameters:",sum([np.prod(p.size()) for p in model.parameters()]))
+        model.cuda()
+
+        # set up the optimizer
+        opt = torch.optim.Adam(model.parameters(), 1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=45, gamma=0.1)
+        
+        xtr = torch.utils.data.DataLoader(xtr, batch_size=100)
+        xte = torch.utils.data.DataLoader(xte, batch_size=100)
+
+        privacy_engine = opacus.PrivacyEngine()
+        model, opt, xtr = privacy_engine.make_private_with_epsilon(
+            module=model,
+            optimizer=opt,
+            data_loader=xtr,
+            # noise_multiplier=1.1,
+            max_grad_norm=1.0,
+            target_epsilon=10,
+            target_delta=1e-5,
+            epochs=100
+        )        
+
+        # start the training
+        for epoch in range(100):
+            print("epoch %d" % (epoch, ))
+            scheduler.step(epoch)
+            run_epoch_withdp('test', upto=5) # run only a few batches for approximate test accuracy
+            run_epoch_withdp('train')
+        
+        print("optimization done. full test set eval:")
+        run_epoch_withdp('test')
